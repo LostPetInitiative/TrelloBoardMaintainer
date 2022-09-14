@@ -17,7 +17,7 @@ RUN go build -o /trelloBoardMaintainer
 
 
 ## Deploy
-FROM alpine
+FROM alpine as final
 WORKDIR /
 COPY --from=build /trelloBoardMaintainer /trelloBoardMaintainer
 
