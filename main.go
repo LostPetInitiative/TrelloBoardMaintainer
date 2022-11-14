@@ -14,9 +14,10 @@ import (
 
 const TRELLO_KEY_ENV = "TRELLO_KEY"
 const TRELLO_TOKEN_ENV = "TRELLO_TOKEN"
+const TRELLO_DELETE_LISTS_ENV = "TRELLO_DELETE_LISTS"
 const TRELLO_ARCHIVES_LISTS_ENV = "TRELLO_ARCHIVE_LISTS"
 const TRELLO_REORDER_LISTS_ENV = "TRELLO_REORDER_LISTS"
-const CARD_INACTIVITY_ARCHIVAL_THRESHOLD_HOURS_ENV = "CARD_INACTIVITY_ARCHIVAL_THRESHOLD_HOURS"
+const CARD_INACTIVITY_THRESHOLD_HOURS_ENV = "CARD_INACTIVITY_THRESHOLD_HOURS"
 
 func extractEnvOrExit(envKey string) string {
 	data, defined := os.LookupEnv(envKey)
@@ -34,7 +35,14 @@ func extractEnvOrDefault(envKey string, defaultVal string) string {
 	return data
 }
 
-func checkCardForArchive(list *trello.List, card *trello.Card, inactivityTimeSpan time.Duration, now time.Time, wg *sync.WaitGroup) {
+type staleCardActionEnum int32
+
+const (
+	staleCardActionDelete staleCardActionEnum = iota + 1
+	staleCardActionArchive
+)
+
+func checkCardForStaleness(list *trello.List, card *trello.Card, inactivityTimeSpan time.Duration, now time.Time, wg *sync.WaitGroup, staleAction staleCardActionEnum) {
 	defer wg.Done()
 	var latestActionTime time.Time = time.UnixMilli(0)
 
@@ -84,8 +92,15 @@ func checkCardForArchive(list *trello.List, card *trello.Card, inactivityTimeSpa
 
 	elapsed := now.Sub(latestActionTime)
 	if elapsed > inactivityTimeSpan {
-		log.Printf("Card \"%v\" (%v) is due to archive as last activity was %v ago\n", card.Name, card.ID, elapsed)
-		card.Archive()
+		log.Printf("Card \"%v\" (%v) is due to stale action as last activity was %v ago\n", card.Name, card.ID, elapsed)
+		switch staleAction {
+		case staleCardActionDelete:
+			card.Delete()
+		case staleCardActionArchive:
+			card.Archive()
+		default:
+			log.Panicf("Unsupported stale card action: %v", staleAction)
+		}
 	}
 }
 
@@ -128,21 +143,41 @@ func fetchList(client *trello.Client, listId string) *trello.List {
 	return list
 }
 
+// Splits the "commaSepListId" by comma to get list ids.
+// For each listId applies listAction as gorotine.
+// Waits until all of the lists processing complete
+func processLists(commaSepListId string, processingDescription string, listAction func(listId string, wg *sync.WaitGroup)) {
+	var wg sync.WaitGroup
+
+	listIdsSplit := strings.Split(commaSepListId, ",")
+	var N = len(listIdsSplit)
+
+	log.Printf("%d lists to check for %s...\n", N, processingDescription)
+	wg.Add(N)
+	for _, listId := range listIdsSplit {
+		go listAction(listId, &wg)
+		//go checkListForStaleCards(listId, &wg, staleCardActionArchive)
+	}
+	wg.Wait()
+	log.Printf("Done with %s\n", processingDescription)
+}
+
 func main() {
 	trelloAppKey := extractEnvOrExit(TRELLO_KEY_ENV)
 	trelloToken := extractEnvOrExit(TRELLO_TOKEN_ENV)
 	trelloReorderLists := extractEnvOrDefault(TRELLO_REORDER_LISTS_ENV, "")
 	trelloArchiveLists := extractEnvOrDefault(TRELLO_ARCHIVES_LISTS_ENV, "")
-	cardInactivityArchivalThresholdHoursStr := extractEnvOrDefault(CARD_INACTIVITY_ARCHIVAL_THRESHOLD_HOURS_ENV, "336")
-	cardInactivityArchivalThresholdHours, err := strconv.ParseFloat(cardInactivityArchivalThresholdHoursStr, 64)
+	trelloDeleteLists := extractEnvOrDefault(TRELLO_DELETE_LISTS_ENV, "")
+	cardInactivityThresholdHoursStr := extractEnvOrDefault(CARD_INACTIVITY_THRESHOLD_HOURS_ENV, "336")
+	cardInactivityThresholdHours, err := strconv.ParseFloat(cardInactivityThresholdHoursStr, 64)
 	if err != nil {
-		log.Fatalf("ERROR: can't parse number of card inactivity archival threshold (hours). String: %s \n", cardInactivityArchivalThresholdHoursStr)
+		log.Fatalf("ERROR: can't parse number of card inactivity threshold (hours). String: %s \n", cardInactivityThresholdHoursStr)
 	}
-	var cardInactivityArchivalThreshold time.Duration = time.Duration(cardInactivityArchivalThresholdHours * 60 * 60 * 1e9)
+	var cardInactivityThreshold time.Duration = time.Duration(cardInactivityThresholdHours * 60 * 60 * 1e9)
 
 	client := trello.NewClient(trelloAppKey, trelloToken)
 
-	checkListForCardArchival := func(listId string, wg *sync.WaitGroup) {
+	checkListForStaleCards := func(listId string, wg *sync.WaitGroup, staleCardAction staleCardActionEnum) {
 		list := fetchList(client, listId)
 		log.Printf("Querying cards of the list %v (%v)... \n", listId, list.Name)
 		cards, err := list.GetCards()
@@ -156,27 +191,32 @@ func main() {
 		var archivalCheckWg sync.WaitGroup
 		archivalCheckWg.Add(len(cards))
 		for _, card := range cards {
-			go checkCardForArchive(list, card, cardInactivityArchivalThreshold, now, &archivalCheckWg)
+			go checkCardForStaleness(
+				list, card, cardInactivityThreshold, now,
+				&archivalCheckWg,
+				staleCardAction)
 		}
 		archivalCheckWg.Wait()
 		wg.Done()
-		log.Printf("List %v processed for card archival", list.Name)
+		log.Printf("List %v processed for stale cards", list.Name)
 	}
 
-	var wg sync.WaitGroup
-
-	var N int = 0
 	if len(trelloArchiveLists) > 0 {
-		trelloArchiveListsSplit := strings.Split(trelloArchiveLists, ",")
-		N = len(trelloArchiveListsSplit)
+		processLists(
+			trelloArchiveLists,
+			"stale cards archival",
+			func(listId string, wg *sync.WaitGroup) {
+				checkListForStaleCards(listId, wg, staleCardActionArchive)
+			})
+	}
 
-		log.Printf("%d lists to check for card archival...\n", N)
-		wg.Add(N)
-		for _, listId := range trelloArchiveListsSplit {
-			go checkListForCardArchival(listId, &wg)
-		}
-		wg.Wait()
-		log.Print("Done with card archival")
+	if len(trelloDeleteLists) > 0 {
+		processLists(
+			trelloDeleteLists,
+			"stale cards delete",
+			func(listId string, wg *sync.WaitGroup) {
+				checkListForStaleCards(listId, wg, staleCardActionDelete)
+			})
 	}
 
 	checkListForCardReorder := func(listId string, wg *sync.WaitGroup) {
@@ -198,17 +238,11 @@ func main() {
 		log.Printf("List %v processed for card reorder", list.Name)
 	}
 
-	N = 0
 	if len(trelloReorderLists) > 0 {
-		trelloReorderListsSplit := strings.Split(trelloReorderLists, ",")
-		N = len(trelloReorderListsSplit)
-		log.Printf("%d lists to check for card reorder...\n", N)
-		wg.Add(N)
-		for _, listId := range trelloReorderListsSplit {
-			go checkListForCardReorder(listId, &wg)
-		}
-		wg.Wait()
-		log.Print("Done with card reorder")
+		processLists(
+			trelloReorderLists,
+			"cards reorder",
+			checkListForCardReorder)
 	}
 
 	log.Println("Done")
